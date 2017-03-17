@@ -507,9 +507,6 @@ public class SubscriptionInfoUpdater extends Handler {
                         editor.putInt(CURR_SUBID + i, subId);
                         editor.apply();
                     }
-                    // SUB ID is also filled in the intent, ensure informing a valid SUB ID.
-                    broadcastSimStateChanged(i,
-                            IccCardConstants.INTENT_VALUE_ICC_LOADED, null);
                 } else {
                     logd("inactive subId = " + subId + " slotId = " +  i
                             + ", could not update ContentResolver");
@@ -522,6 +519,7 @@ public class SubscriptionInfoUpdater extends Handler {
                 mPackageManager, TelephonyManager.getDefault(), mContext.getContentResolver(),
                 mCurrentlyActiveUserId);
 
+        broadcastSimStateChanged(slotId, IccCardConstants.INTENT_VALUE_ICC_LOADED, null);
         updateCarrierServices(slotId, IccCardConstants.INTENT_VALUE_ICC_LOADED);
     }
 
