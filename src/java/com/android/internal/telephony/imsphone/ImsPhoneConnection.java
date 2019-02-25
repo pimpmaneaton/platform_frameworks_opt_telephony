@@ -45,6 +45,7 @@ import com.android.internal.telephony.CallStateException;
 import com.android.internal.telephony.Connection;
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
+import com.android.internal.telephony.TelephonyProperties;
 import com.android.internal.telephony.UUSInfo;
 
 import java.util.Objects;
@@ -213,17 +214,37 @@ public class ImsPhoneConnection extends Connection implements
     /** This is an MO call, created when dialing */
     public ImsPhoneConnection(Phone phone, String dialString, ImsPhoneCallTracker ct,
             ImsPhoneCall parent, boolean isEmergency) {
+        this(phone, dialString, ct, parent, isEmergency, null);
+    }
+
+    /** This is an MO call, created when dialing */
+    public ImsPhoneConnection(Phone phone, String dialString, ImsPhoneCallTracker ct,
+            ImsPhoneCall parent, boolean isEmergency, Bundle extras) {
         super(PhoneConstants.PHONE_TYPE_IMS);
         createWakeLock(phone.getContext());
         acquireWakeLock();
+        boolean isConferenceUri = false;
+        boolean isSkipSchemaParsing = false;
+
+        if (extras != null) {
+            isConferenceUri = extras.getBoolean(
+                    TelephonyProperties.EXTRA_DIAL_CONFERENCE_URI, false);
+            isSkipSchemaParsing = extras.getBoolean(
+                    TelephonyProperties.EXTRA_SKIP_SCHEMA_PARSING, false);
+        }
 
         mOwner = ct;
         mHandler = new MyHandler(mOwner.getLooper());
 
         mDialString = dialString;
 
-        mAddress = PhoneNumberUtils.extractNetworkPortionAlt(dialString);
-        mPostDialString = PhoneNumberUtils.extractPostDialPortion(dialString);
+        if (isConferenceUri || isSkipSchemaParsing) {
+            mAddress = dialString;
+            mPostDialString = "";
+        } else {
+            mAddress = PhoneNumberUtils.extractNetworkPortionAlt(dialString);
+            mPostDialString = PhoneNumberUtils.extractPostDialPortion(dialString);
+        }
 
         //mIndex = -1;
 
@@ -275,6 +296,10 @@ public class ImsPhoneConnection extends Connection implements
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_LOCAL_BIDIRECTIONAL);
                 break;
+            case ImsCallProfile.CALL_TYPE_VT_NODIR:
+                capabilities = removeCapability(capabilities,
+                        Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_LOCAL);
+                break;
         }
         return capabilities;
     }
@@ -291,6 +316,14 @@ public class ImsPhoneConnection extends Connection implements
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_REMOTE_BIDIRECTIONAL);
                 break;
+            case ImsCallProfile.CALL_TYPE_VT_NODIR:
+                capabilities = removeCapability(capabilities,
+                        Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_REMOTE);
+                break;
+        }
+
+        if (remoteProfile.getMediaProfile().getRttMode() == ImsStreamMediaProfile.RTT_MODE_FULL) {
+            capabilities = addCapability(capabilities, Connection.Capability.SUPPORTS_RTT_REMOTE);
         }
         return capabilities;
     }
@@ -458,6 +491,9 @@ public class ImsPhoneConnection extends Connection implements
                 Rlog.d(LOG_TAG, "onDisconnect: no parent");
             }
             synchronized (this) {
+                if (mRttTextHandler != null) {
+                    mRttTextHandler.tearDown();
+                }
                 if (mImsCall != null) mImsCall.close();
                 mImsCall = null;
             }
@@ -952,6 +988,15 @@ public class ImsPhoneConnection extends Connection implements
                 changed = true;
             }
 
+            if (!mOwner.isViLteDataMetered()) {
+                Rlog.v(LOG_TAG, "data is not metered");
+            } else {
+                if (mImsVideoCallProviderWrapper != null) {
+                    mImsVideoCallProviderWrapper.setIsVideoEnabled(
+                            hasCapabilities(Connection.Capability.SUPPORTS_VT_LOCAL_BIDIRECTIONAL));
+                }
+            }
+
             int newAudioQuality =
                     getAudioQualityFromCallProfile(localCallProfile, remoteCallProfile);
             if (getAudioQuality() != newAudioQuality) {
@@ -973,8 +1018,11 @@ public class ImsPhoneConnection extends Connection implements
     }
 
     public void sendRttModifyRequest(android.telecom.Connection.RttTextStream textStream) {
-        getImsCall().sendRttModifyRequest();
-        setCurrentRttTextStream(textStream);
+        ImsCall imsCall = getImsCall();
+        if (imsCall != null) {
+            getImsCall().sendRttModifyRequest();
+            setCurrentRttTextStream(textStream);
+        }
     }
 
     /**
@@ -987,11 +1035,13 @@ public class ImsPhoneConnection extends Connection implements
         boolean accept = textStream != null;
         ImsCall imsCall = getImsCall();
 
-        imsCall.sendRttModifyResponse(accept);
-        if (accept) {
-            setCurrentRttTextStream(textStream);
-        } else {
-            Rlog.e(LOG_TAG, "sendRttModifyResponse: foreground call has no connections");
+        if (imsCall != null) {
+            imsCall.sendRttModifyResponse(accept);
+            if (accept) {
+                setCurrentRttTextStream(textStream);
+            } else {
+                Rlog.e(LOG_TAG, "sendRttModifyResponse: foreground call has no connections");
+            }
         }
     }
 
@@ -1009,6 +1059,12 @@ public class ImsPhoneConnection extends Connection implements
             }
         }
         mRttTextHandler.sendToInCall(message);
+    }
+
+    public void onCallSessionPropertyChanged(int property) {
+        Bundle extras = new Bundle();
+        extras.putInt(android.telecom.Connection.EXTRA_CALL_PROPERTY, property);
+        onConnectionEvent(android.telecom.Connection.EVENT_CALL_PROPERTY_CHANGED, extras);
     }
 
     public void setCurrentRttTextStream(android.telecom.Connection.RttTextStream rttTextStream) {
@@ -1046,7 +1102,12 @@ public class ImsPhoneConnection extends Connection implements
     // Make sure to synchronize on ImsPhoneConnection.this before calling.
     private void createRttTextHandler() {
         mRttTextHandler = new ImsRttTextHandler(Looper.getMainLooper(),
-                (message) -> getImsCall().sendRttMessage(message));
+                (message) -> {
+                    ImsCall imsCall = getImsCall();
+                    if (imsCall != null) {
+                        imsCall.sendRttMessage(message);
+                    }
+                });
         mRttTextHandler.initialize(mRttTextStream);
     }
 
@@ -1319,14 +1380,10 @@ public class ImsPhoneConnection extends Connection implements
         mShouldIgnoreVideoStateChanges = false;
     }
 
-    public void handleDataEnabledChange(boolean isDataEnabled) {
-        mIsVideoEnabled = isDataEnabled;
-        Rlog.i(LOG_TAG, "handleDataEnabledChange: isDataEnabled=" + isDataEnabled
+    public void setVideoEnabled(boolean isVideoEnabled) {
+        mIsVideoEnabled = isVideoEnabled;
+        Rlog.i(LOG_TAG, "setVideoEnabled: mIsVideoEnabled = " + mIsVideoEnabled
                 + "; updating local video availability.");
         updateMediaCapabilities(getImsCall());
-        if (mImsVideoCallProviderWrapper != null) {
-            mImsVideoCallProviderWrapper.setIsVideoEnabled(
-                    hasCapabilities(Connection.Capability.SUPPORTS_VT_LOCAL_BIDIRECTIONAL));
-        }
     }
 }

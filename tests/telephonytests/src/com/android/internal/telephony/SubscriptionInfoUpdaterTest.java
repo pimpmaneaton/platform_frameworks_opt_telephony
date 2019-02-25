@@ -36,6 +36,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.IPackageManager;
 import android.content.pm.UserInfo;
 import android.net.Uri;
 import android.os.HandlerThread;
@@ -90,6 +91,11 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
     private EuiccController mEuiccController;
     @Mock
     private IntentBroadcaster mIntentBroadcaster;
+    @Mock
+    private IPackageManager mPackageManager;
+
+    @Mock
+    GsmCdmaPhone mSecondPhone;
 
     /*Custom ContentProvider */
     private class FakeSubscriptionContentProvider extends MockContentProvider {
@@ -108,7 +114,7 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
         @Override
         public void onLooperPrepared() {
             mUpdater = new SubscriptionInfoUpdater(getLooper(), mContext, new Phone[]{mPhone},
-                    new CommandsInterface[]{mSimulatedCommands});
+                    new CommandsInterface[]{mSimulatedCommands}, mPackageManager);
             setReady(true);
         }
     }
@@ -238,7 +244,7 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
         doReturn(null).when(mSubscriptionController)
                 .getSubInfoUsingSlotIndexPrivileged(eq(FAKE_SUB_ID_1), anyBoolean());
         doReturn("89012604200000000000").when(mIccRecord).getFullIccId();
-        doReturn(FAKE_MCC_MNC_1).when(mTelephonyManager).getSimOperatorNumeric(FAKE_SUB_ID_1);
+        doReturn(FAKE_MCC_MNC_1).when(mPhone).getOperatorNumeric();
 
         mUpdater.updateInternalIccState(
                 IccCardConstants.INTENT_VALUE_ICC_LOADED, null, FAKE_SUB_ID_1);
@@ -264,7 +270,7 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
                 stringArgumentCaptor.getAllValues().get(1)); */
 
         SubscriptionManager mSubscriptionManager = SubscriptionManager.from(mContext);
-        verify(mTelephonyManager).getSimOperatorNumeric(FAKE_SUB_ID_1);
+        verify(mPhone).getOperatorNumeric();
         verify(mSubscriptionManager, times(1)).addSubscriptionInfoRecord(
                 eq("89012604200000000000"), eq(FAKE_SUB_ID_1));
         verify(mSubscriptionController, times(1)).notifySubscriptionInfoChanged();
@@ -304,13 +310,13 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
                 .getSubInfoUsingSlotIndexPrivileged(eq(FAKE_SUB_ID_1), anyBoolean());
         doReturn("89012604200000000000").when(mIccRecord).getFullIccId();
         // operator numeric is empty
-        doReturn("").when(mTelephonyManager).getSimOperatorNumeric(FAKE_SUB_ID_1);
+        doReturn("").when(mPhone).getOperatorNumeric();
         mUpdater.updateInternalIccState(
                 IccCardConstants.INTENT_VALUE_ICC_LOADED, null, FAKE_SUB_ID_1);
 
         waitForMs(100);
         SubscriptionManager mSubscriptionManager = SubscriptionManager.from(mContext);
-        verify(mTelephonyManager).getSimOperatorNumeric(FAKE_SUB_ID_1);
+        verify(mPhone).getOperatorNumeric();
         verify(mSubscriptionManager, times(1)).addSubscriptionInfoRecord(
                 eq("89012604200000000000"), eq(FAKE_SUB_ID_1));
         verify(mSubscriptionController, times(1)).notifySubscriptionInfoChanged();
@@ -356,11 +362,14 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
     public void testDualSimLoaded() throws Exception {
         // Mock there is two sim cards
 
+        doReturn(mUiccProfile).when(mSecondPhone).getIccCard();
+        doReturn(mContext).when(mSecondPhone).getContext();
+
         replaceInstance(SubscriptionInfoUpdater.class, "mIccId", null,
                 new String[]{null, null});
         replaceInstance(SubscriptionInfoUpdater.class, "PROJECT_SIM_NUM", null, 2);
         replaceInstance(SubscriptionInfoUpdater.class, "mPhone", null,
-                new Phone[]{mPhone, mPhone});
+                new Phone[]{mPhone, mSecondPhone});
         replaceInstance(SubscriptionInfoUpdater.class, "mInsertSimState", null,
                 new int[]{SubscriptionInfoUpdater.SIM_NOT_CHANGE,
                         SubscriptionInfoUpdater.SIM_NOT_CHANGE});
@@ -374,8 +383,8 @@ public class SubscriptionInfoUpdaterTest extends TelephonyTest {
         doReturn(FAKE_SUB_ID_1).when(mSubscriptionController).getPhoneId(eq(FAKE_SUB_ID_1));
         doReturn(FAKE_SUB_ID_2).when(mSubscriptionController).getPhoneId(eq(FAKE_SUB_ID_2));
         doReturn(2).when(mTelephonyManager).getSimCount();
-        doReturn(FAKE_MCC_MNC_1).when(mTelephonyManager).getSimOperatorNumeric(eq(FAKE_SUB_ID_1));
-        doReturn(FAKE_MCC_MNC_2).when(mTelephonyManager).getSimOperatorNumeric(eq(FAKE_SUB_ID_2));
+        doReturn(FAKE_MCC_MNC_1).when(mPhone).getOperatorNumeric();
+        doReturn(FAKE_MCC_MNC_2).when(mSecondPhone).getOperatorNumeric();
         // Mock there is no sim inserted before
         doReturn(null).when(mSubscriptionController)
                 .getSubInfoUsingSlotIndexPrivileged(anyInt(), anyBoolean());

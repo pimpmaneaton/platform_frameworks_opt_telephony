@@ -89,9 +89,11 @@ import com.android.internal.telephony.dataconnection.DcTracker;
 import com.android.internal.telephony.dataconnection.TransportManager;
 import com.android.internal.telephony.metrics.TelephonyMetrics;
 import com.android.internal.telephony.uicc.IccCardApplicationStatus.AppState;
+import com.android.internal.telephony.uicc.IccCardStatus.CardState;
 import com.android.internal.telephony.uicc.IccRecords;
 import com.android.internal.telephony.uicc.RuimRecords;
 import com.android.internal.telephony.uicc.SIMRecords;
+import com.android.internal.telephony.uicc.UiccCard;
 import com.android.internal.telephony.uicc.UiccCardApplication;
 import com.android.internal.telephony.uicc.UiccController;
 import com.android.internal.telephony.util.NotificationChannelController;
@@ -219,7 +221,6 @@ public class ServiceStateTracker extends Handler {
     protected static final int EVENT_ALL_DATA_DISCONNECTED             = 49;
     protected static final int EVENT_PHONE_TYPE_SWITCHED               = 50;
     protected static final int EVENT_RADIO_POWER_FROM_CARRIER          = 51;
-    protected static final int EVENT_SIM_NOT_INSERTED                  = 52;
     protected static final int EVENT_IMS_SERVICE_STATE_CHANGED         = 53;
     protected static final int EVENT_RADIO_POWER_OFF_DONE              = 54;
     protected static final int EVENT_PHYSICAL_CHANNEL_CONFIG           = 55;
@@ -286,7 +287,7 @@ public class ServiceStateTracker extends Handler {
             int subId = mPhone.getSubId();
             ServiceStateTracker.this.mPrevSubId = mPreviousSubId.get();
             if (mPreviousSubId.getAndSet(subId) != subId) {
-                if (SubscriptionManager.isValidSubscriptionId(subId)) {
+                if (mSubscriptionController.isActiveSubId(subId)) {
                     Context context = mPhone.getContext();
 
                     mPhone.notifyPhoneStateChanged();
@@ -340,20 +341,12 @@ public class ServiceStateTracker extends Handler {
                 }
                 // update voicemail count and notify message waiting changed
                 mPhone.updateVoiceMail();
-
-                // cancel notifications if we see SIM_NOT_INSERTED (This happens on bootup before
-                // the SIM is first detected and then subsequently on SIM removals)
-                if (mSubscriptionController.getSlotIndex(subId)
-                        == SubscriptionManager.SIM_NOT_INSERTED) {
-                    // this is handled on the main thread to mitigate racing with setNotification().
-                    sendMessage(obtainMessage(EVENT_SIM_NOT_INSERTED));
-                }
             }
         }
     };
 
     //Common
-    private final GsmCdmaPhone mPhone;
+    protected final GsmCdmaPhone mPhone;
 
     public CellLocation mCellLoc;
     private CellLocation mNewCellLoc;
@@ -593,7 +586,9 @@ public class ServiceStateTracker extends Handler {
         }
 
         mSS = new ServiceState();
+        mSS.setStateOutOfService();
         mNewSS = new ServiceState();
+        mNewSS.setStateOutOfService();
         mLastCellInfoListTime = 0;
         mLastCellInfoList = null;
         mSignalStrength = new SignalStrength();
@@ -1015,6 +1010,15 @@ public class ServiceStateTracker extends Handler {
                 break;
 
             case EVENT_ICC_CHANGED:
+                if (isSimAbsent()) {
+                    if (DBG) log("EVENT_ICC_CHANGED: SIM absent");
+                    // cancel notifications if SIM is removed/absent
+                    cancelAllNotifications();
+                    // clear cached values on SIM removal
+                    mMdn = null;
+                    mMin = null;
+                    mIsMinInfoReady = false;
+                }
                 onUpdateIccAvailability();
                 if (mUiccApplcation != null
                         && mUiccApplcation.getState() != AppState.APPSTATE_READY) {
@@ -1272,14 +1276,6 @@ public class ServiceStateTracker extends Handler {
                 }
                 break;
 
-            case EVENT_SIM_NOT_INSERTED:
-                if (DBG) log("EVENT_SIM_NOT_INSERTED");
-                cancelAllNotifications();
-                mMdn = null;
-                mMin = null;
-                mIsMinInfoReady = false;
-                break;
-
             case EVENT_ALL_DATA_DISCONNECTED:
                 int dds = SubscriptionManager.getDefaultDataSubscriptionId();
                 ProxyController.getInstance().unregisterForAllDataDisconnected(dds, this);
@@ -1475,6 +1471,21 @@ public class ServiceStateTracker extends Handler {
         }
     }
 
+    private boolean isSimAbsent() {
+        boolean simAbsent;
+        if (mUiccController == null) {
+            simAbsent = true;
+        } else {
+            UiccCard uiccCard = mUiccController.getUiccCard(mPhone.getPhoneId());
+            if (uiccCard == null) {
+                simAbsent = true;
+            } else {
+                simAbsent = (uiccCard.getCardState() == CardState.CARDSTATE_ABSENT);
+            }
+        }
+        return simAbsent;
+    }
+
     private int[] getBandwidthsFromConfigs(List<PhysicalChannelConfig> list) {
         return list.stream()
                 .map(PhysicalChannelConfig::getCellBandwidthDownlink)
@@ -1529,7 +1540,7 @@ public class ServiceStateTracker extends Handler {
                 getSystemService(Context.TELEPHONY_SERVICE)).
                 getSimOperatorNumericForPhone(mPhone.getPhoneId());
 
-        if (!TextUtils.isEmpty(operatorNumeric) && getCdmaMin() != null) {
+        if (!TextUtils.isEmpty(operatorNumeric) && !TextUtils.isEmpty(getCdmaMin())) {
             return (operatorNumeric + getCdmaMin());
         } else {
             return null;
@@ -1660,9 +1671,9 @@ public class ServiceStateTracker extends Handler {
         mPollingContext[0]--;
 
         if (mPollingContext[0] == 0) {
+            mNewSS.setEmergencyOnly(mEmergencyOnly);
             if (mPhone.isPhoneTypeGsm()) {
                 updateRoamingState();
-                mNewSS.setEmergencyOnly(mEmergencyOnly);
             } else {
                 boolean namMatch = false;
                 if (!isSidsAllZeros() && isHomeSid(mNewSS.getCdmaSystemId())) {
@@ -1783,7 +1794,8 @@ public class ServiceStateTracker extends Handler {
         return cdmaRoaming && !isSameOperatorNameFromSimAndSS(s);
     }
 
-    void handlePollStateResultMessage(int what, AsyncResult ar) {
+
+    protected void handlePollStateResultMessage(int what, AsyncResult ar) {
         int ints[];
         switch (what) {
             case EVENT_POLL_STATE_REGISTRATION: {
@@ -1804,6 +1816,7 @@ public class ServiceStateTracker extends Handler {
 
                 //Denial reason if registrationState = 3
                 int reasonForDenial = networkRegState.getReasonForDenial();
+                mEmergencyOnly = networkRegState.isEmergencyEnabled();
                 if (mPhone.isPhoneTypeGsm()) {
 
                     mGsmRoaming = regCodeIsRoaming(registrationState);
@@ -1811,7 +1824,6 @@ public class ServiceStateTracker extends Handler {
 
                     boolean isVoiceCapable = mPhone.getContext().getResources()
                             .getBoolean(com.android.internal.R.bool.config_voice_capable);
-                    mEmergencyOnly = networkRegState.isEmergencyEnabled();
                 } else {
                     int roamingIndicator = voiceSpecificStates.roamingIndicator;
 
@@ -2231,8 +2243,32 @@ public class ServiceStateTracker extends Handler {
         mNewSS.setCdmaEriIconIndex(EriInfo.ROAMING_INDICATOR_OFF);
     }
 
+    private void updateOperatorNameFromCarrierConfig() {
+        // Brand override gets a priority over carrier config. If brand override is not available,
+        // override the operator name in home network. Also do this only for CDMA. This is temporary
+        // and should be fixed in a proper way in a later release.
+        if (!mPhone.isPhoneTypeGsm() && !mSS.getRoaming()) {
+            boolean hasBrandOverride = mUiccController.getUiccCard(getPhoneId()) != null
+                    && mUiccController.getUiccCard(getPhoneId()).getOperatorBrandOverride() != null;
+            if (!hasBrandOverride) {
+                PersistableBundle config = getCarrierConfig();
+                if (config.getBoolean(
+                        CarrierConfigManager.KEY_CDMA_HOME_REGISTERED_PLMN_NAME_OVERRIDE_BOOL)) {
+                    String operator = config.getString(
+                            CarrierConfigManager.KEY_CDMA_HOME_REGISTERED_PLMN_NAME_STRING);
+                    log("updateOperatorNameFromCarrierConfig: changing from "
+                            + mSS.getOperatorAlpha() + " to " + operator);
+                    // override long and short operator name, keeping numeric the same
+                    mSS.setOperatorName(operator, operator, mSS.getOperatorNumeric());
+                }
+            }
+        }
+    }
+
     protected void updateSpnDisplay() {
         updateOperatorNameFromEri();
+        // carrier config gets a priority over ERI
+        updateOperatorNameFromCarrierConfig();
 
         String wfcVoiceSpnFormat = null;
         String wfcDataSpnFormat = null;
@@ -2908,6 +2944,12 @@ public class ServiceStateTracker extends Handler {
             }
         }
 
+        if (hasRilVoiceRadioTechnologyChanged || hasRilDataRadioTechnologyChanged) {
+            // Technology has changed, try to fix signal strength type.
+            mSignalStrength.fixType();
+            notifySignalStrength();
+        }
+
         if (hasRegistered) {
             mNetworkAttachedRegistrants.notifyRegistrants();
             mNitzState.handleNetworkAvailable();
@@ -3094,7 +3136,8 @@ public class ServiceStateTracker extends Handler {
             if (!hasBrandOverride && (mCi.getRadioState().isOn()) && (mPhone.isEriFileLoaded()) &&
                     (!ServiceState.isLte(mSS.getRilVoiceRadioTechnology()) ||
                             mPhone.getContext().getResources().getBoolean(com.android.internal.R.
-                                    bool.config_LTE_eri_for_network_name))) {
+                                    bool.config_LTE_eri_for_network_name)) &&
+                                    (!mIsSubscriptionFromRuim)) {
                 // Only when CDMA is in service, ERI will take effect
                 String eriText = mSS.getOperatorAlpha();
                 // Now the Phone sees the new ServiceState so it can get the new ERI text
@@ -3935,15 +3978,10 @@ public class ServiceStateTracker extends Handler {
     public void powerOffRadioSafely(DcTracker dcTracker) {
         synchronized (this) {
             if (!mPendingRadioPowerOffAfterDataOff) {
-                int dds = SubscriptionManager.getDefaultDataSubscriptionId();
                 // To minimize race conditions we call cleanUpAllConnections on
                 // both if else paths instead of before this isDisconnected test.
-                if (dcTracker.isDisconnected()
-                        && (dds == mPhone.getSubId()
-                        || (dds != mPhone.getSubId()
-                        && ProxyController.getInstance().isDataDisconnected(dds)))) {
+                if (dcTracker.isDisconnected()) {
                     // To minimize race conditions we do this after isDisconnected
-                    dcTracker.cleanUpAllConnections(Phone.REASON_RADIO_TURNED_OFF);
                     if (DBG) log("Data disconnected, turn off radio right away.");
                     hangupAndPowerOff();
                 } else {
@@ -3953,16 +3991,14 @@ public class ServiceStateTracker extends Handler {
                         mPhone.mCT.mBackgroundCall.hangupIfAlive();
                         mPhone.mCT.mForegroundCall.hangupIfAlive();
                     }
+                    if (DBG) log("Wait for all data disconnect");
+                    // Data is not disconnected. Wait for the data disconnect complete
+                    // before sending the RADIO_POWER off.
+                    ProxyController.getInstance().registerForAllDataDisconnected(
+                            mPhone.getSubId(), this, EVENT_ALL_DATA_DISCONNECTED, null);
+                    mPendingRadioPowerOffAfterDataOff = true;
                     dcTracker.cleanUpAllConnections(Phone.REASON_RADIO_TURNED_OFF);
-                    if (dds != mPhone.getSubId()
-                            && !ProxyController.getInstance().isDataDisconnected(dds)) {
-                        if (DBG) log("Data is active on DDS.  Wait for all data disconnect");
-                        // Data is not disconnected on DDS. Wait for the data disconnect complete
-                        // before sending the RADIO_POWER off.
-                        ProxyController.getInstance().registerForAllDataDisconnected(dds, this,
-                                EVENT_ALL_DATA_DISCONNECTED, null);
-                        mPendingRadioPowerOffAfterDataOff = true;
-                    }
+
                     Message msg = Message.obtain(this);
                     msg.what = EVENT_SET_RADIO_POWER_OFF;
                     msg.arg1 = ++mPendingRadioPowerOffAfterDataOffTag;
@@ -4149,6 +4185,10 @@ public class ServiceStateTracker extends Handler {
                     CarrierConfigManager.KEY_WCDMA_DEFAULT_SIGNAL_STRENGTH_MEASUREMENT_STRING));
             mSignalStrength.setWcdmaRscpThresholds(config.getIntArray(
                     CarrierConfigManager.KEY_WCDMA_RSCP_THRESHOLDS_INT_ARRAY));
+
+            if (mSignalStrength.getLevel() == SignalStrength.SIGNAL_STRENGTH_NONE_OR_UNKNOWN) {
+                mSignalStrength.fixType();
+            }
         } else {
             log("onSignalStrengthResult() Exception from RIL : " + ar.exception);
             mSignalStrength = new SignalStrength(isGsm);
